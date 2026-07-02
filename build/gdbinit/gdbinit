@@ -1,0 +1,2 @@
+source C:/esp/v6.0.2/esp-idf/sensor-logger/build/gdbinit/symbols
+source C:/esp/v6.0.2/esp-idf/sensor-logger/build/gdbinit/connect
