@@ -1,8 +1,8 @@
 # ESP32 Multi-Sensor Data Logger
 
-A real-time embedded data acquisition system built in C on ESP-IDF v6.0.2 and FreeRTOS. Integrates a VL53L0X time-of-flight distance sensor and a MAX30102 PPG heart rate sensor over a shared I2C bus, with an onboard signal processing pipeline for BPM extraction.
+A real-time embedded data acquisition system built in C on ESP-IDF v6.0.2 and FreeRTOS. Drives a MAX30102 PPG heart rate sensor over I2C with an onboard signal processing pipeline for BPM extraction. A VL53L0X time-of-flight distance sensor is wired into the build (driver, C++ wrapper, CMake target) but is **not currently invoked from `app_main`** — see [Known Issues and Limitations](#known-issues-and-limitations).
 
-Built as a practical exercise in bare-metal embedded systems: custom register-level drivers, C/C++ interoperability at the FFI boundary, shared bus arbitration, and real-time DSP under hard timing constraints.
+Built as a practical exercise in bare-metal embedded systems: custom register-level drivers and C/C++ interoperability at the FFI boundary. Shared-bus arbitration and hard real-time DSP are targeted future work, not yet implemented — see below.
 
 ---
 
@@ -28,14 +28,14 @@ This project demonstrates end-to-end sensor integration on the ESP32 — from ha
 
 **What it does:**
 
-- Continuously polls a VL53L0X ToF sensor for millimeter-precision distance readings
-- Samples the MAX30102 photodiode at 100 Hz via a FreeRTOS timer callback
+- Samples the MAX30102 photodiode at roughly 100 Hz via a FreeRTOS software timer callback
 - Runs the raw IR signal through a DC-removal stage, a low-pass IIR filter, and an adaptive peak detector
 - Outputs instantaneous BPM estimates over UART at each detected heartbeat
+- Includes a VL53L0X ToF driver (register-level init + read, wrapped for C linkage) that builds successfully but is currently dead code — its call site in `app_main` is commented out
 
 **Why it exists:**
 
-Most ESP32 sensor tutorials lean on pre-packaged Arduino libraries that hide the I2C register map, FIFO management, and interrupt logic. This project implements both drivers from their respective datasheets to make every layer of the stack explicit — useful for understanding what "driver code" actually does, and as a reference for integrating sensors in production firmware without external dependencies.
+Most ESP32 sensor tutorials lean on pre-packaged Arduino libraries that hide the I2C register map, FIFO management, and interrupt logic. This project implements the MAX30102 driver directly from its datasheet to make that layer of the stack explicit, and integrates ST's official VL53L0X ranging API behind a C wrapper — useful for understanding what "driver code" actually does, and as a reference for integrating sensors in production firmware without external dependencies.
 
 ---
 
@@ -81,7 +81,7 @@ Pull-up resistors (4.7 kΩ to 3.3V) on SDA and SCL are required. Most breakout b
 | VL53L0X vendor driver | Espressif component mirror | `components/vl53l0x/` |
 | MAX30102 driver | Custom (this repo) | `main/pulse_sensor.c` |
 
-The MAX30102 driver has **no external dependencies** — it is written entirely against the register map in the [MAX30102 datasheet](https://www.analog.com/media/en/technical-documentation/data-sheets/max30102.pdf) using the ESP-IDF `i2c_master` driver.
+The MAX30102 driver has **no external dependencies** — it is written entirely against the register map in the [MAX30102 datasheet](https://www.analog.com/media/en/technical-documentation/data-sheets/max30102.pdf) using ESP-IDF's legacy `driver/i2c.h` API (`i2c_param_config` / `i2c_driver_install` / `i2c_master_write_to_device` / `i2c_master_write_read_device`), not the newer handle-based `i2c_master_bus_handle_t` API.
 
 The VL53L0X vendor driver is a C++ library. A thin `extern "C"` wrapper (`tof_wrapper.cpp`) exposes an opaque C API so the rest of the firmware stays in C.
 
@@ -173,8 +173,9 @@ idf.py fullclean && idf.py build
 │                        FreeRTOS Scheduler                        │
 │                                                                   │
 │   ┌─────────────────────────┐   ┌──────────────────────────┐    │
-│   │   app_main task         │   │  100Hz timer callback     │    │
-│   │   (startup + ToF loop)  │   │  (MAX30102 sample + DSP)  │    │
+│   │   app_main task         │   │  ~100Hz software timer    │    │
+│   │   (startup, I2C scan,   │   │  callback                 │    │
+│   │    idle loop)           │   │  (MAX30102 sample + DSP)  │    │
 │   └────────────┬────────────┘   └──────────────┬───────────┘    │
 │                │                               │                  │
 └────────────────┼───────────────────────────────┼─────────────────┘
@@ -182,6 +183,7 @@ idf.py fullclean && idf.py build
         ┌────────▼────────┐             ┌────────▼────────┐
         │  tof_wrapper.h  │             │  pulse_sensor.h  │
         │  (C API, .h)    │             │  (C API, .h)     │
+        │  built, unused  │             │                  │
         └────────┬────────┘             └────────┬────────┘
                  │                               │
         ┌────────▼────────┐             ┌────────▼────────┐
@@ -199,11 +201,13 @@ idf.py fullclean && idf.py build
                  └──────────────┬────────────────┘
                                 │
                     ┌───────────▼───────────┐
-                    │   ESP-IDF I2C master  │
-                    │   (shared bus,        │
-                    │    GPIO22/GPIO23)     │
+                    │  ESP-IDF legacy I2C   │
+                    │  driver (I2C_NUM_0,   │
+                    │  GPIO22/GPIO23)       │
                     └───────────────────────┘
 ```
+
+Both drivers target the same I2C bus, but at runtime only the MAX30102 path is active — the ToF branch in `app_main` is commented out (see `main/sensor-logger.c`), so the two never actually contend for the bus today.
 
 ### C/C++ Interoperability Boundary
 
@@ -230,23 +234,18 @@ The `.cpp` file includes the C++ vendor headers freely, then implements the two 
 
 ### I2C Bus Sharing
 
-Both sensors share the same ESP-IDF `i2c_master_bus_handle_t`. The bus handle is initialized once in `app_main` and passed to both driver init functions. Each driver holds its own `i2c_master_dev_handle_t` bound to its 7-bit address.
-
-Because the FreeRTOS timer callback and the `app_main` task both issue I2C transactions, access is serialized with a mutex (`SemaphoreHandle_t i2c_mutex`). Each driver acquires the mutex before any transaction sequence and releases it on completion or error. This prevents interleaved start/stop conditions from corrupting in-flight transfers.
+Both drivers target `I2C_NUM_0` (initialized once in `app_main` via the legacy `driver/i2c.h` API), but at runtime only the MAX30102 driver is ever called — the ToF init/read call site is commented out. **There is currently no mutex or other arbitration around the bus.** If the ToF path were re-enabled while the sampling timer is running, its I2C transactions and the timer callback's transactions would have no serialization between them, risking interleaved start/stop conditions. Adding a `SemaphoreHandle_t` around each driver's transaction sequence is required before both sensors can safely run concurrently — see [Future Improvements](#future-improvements).
 
 ### FreeRTOS Timer-Based Sampling
 
-The MAX30102 is sampled in an `esp_timer` periodic callback at 100 Hz (10 ms period). Using `esp_timer` rather than a FreeRTOS software timer gives microsecond-resolution scheduling and avoids jitter introduced by the FreeRTOS tick granularity.
+The MAX30102 is sampled via `xTimerCreate`, a FreeRTOS **software** timer, with a nominal 10 ms period (`pdMS_TO_TICKS(10)`, ~100 Hz). `CONFIG_FREERTOS_HZ` in `sdkconfig` is set to 100, meaning the FreeRTOS tick itself is also 10 ms — the timer period equals the tick granularity, so actual callback firing is subject to tick-level jitter rather than the microsecond-resolution scheduling an `esp_timer`-based callback would give. Migrating to `esp_timer` is targeted future work.
 
-The callback:
-1. Acquires the I2C mutex
-2. Reads the FIFO write pointer and overflow counter
-3. Bursts the available samples from the FIFO
-4. Releases the mutex
-5. Runs each sample through the DSP pipeline
-6. If a peak is detected, computes and logs BPM
+The callback (`sampling_callback` in `main/sensor-logger.c`):
+1. Reads one sample from the MAX30102 FIFO (`max30102_read`) — not a burst of all available samples
+2. Runs the sample through the DSP pipeline
+3. If a peak is detected, computes and logs BPM
 
-The callback executes in the `esp_timer` task context, which runs at a high priority. Keep work inside the callback minimal and non-blocking.
+The callback executes in the FreeRTOS timer service task context. Keep work inside the callback minimal and non-blocking.
 
 ---
 
@@ -254,57 +253,56 @@ The callback executes in the `esp_timer` task context, which runs at a high prio
 
 ### VL53L0X (Time-of-Flight)
 
-The vendor driver handles the sensor's full single-ranging initialization sequence: SPAD calibration, reference calibration, and timing budget configuration. The wrapper exposes two calls:
+The vendor driver (`components/vl53l0x/`) handles the sensor's full single-ranging initialization sequence: SPAD calibration, reference calibration, and timing budget configuration. `main/tof_wrapper.cpp` wraps it behind a C API:
 
-- `tof_init()` — runs the full initialization sequence, sets 33 ms timing budget
-- `tof_read_mm(uint16_t *out_mm)` — triggers a single ranging measurement and blocks until the result register is populated (typically < 40 ms)
+- `tof_init(void)` — calls the vendor driver's `i2cMasterInit()` then `init()`; returns `bool`
+- `tof_read(uint16_t *range_mm)` — triggers a single ranging measurement via the vendor driver's `read()`; returns `bool`
 
-Return value is 0 on success, negative errno on failure. The caller in `app_main` logs the distance and loops with a `vTaskDelay`.
+Both functions build and link correctly, but **neither is currently called** — the call site in `app_main` (`main/sensor-logger.c`) is commented out, so this driver and the vendor calibration path it depends on never execute at runtime today. XSHUT is left floating (pulled high), matching the wiring notes above, since no GPIO toggling is implemented.
 
 ### MAX30102 (PPG / Heart Rate)
 
 No vendor library is used. The driver directly addresses the MAX30102 register map over I2C.
 
-**Initialization sequence:**
+**Initialization sequence** (`max30102_init` in `main/pulse_sensor.c`):
 
 1. Reset the device (`REG_MODE_CONFIG`, bit 6)
-2. Wait for reset to complete (poll bit 6 until clear)
-3. Configure FIFO: sample averaging = 4, FIFO rollover enabled, FIFO almost-full threshold = 17
-4. Set mode to SpO2 (both Red and IR LEDs active)
-5. Set SpO2 ADC range = 4096 nA, sample rate = 100 SPS, LED pulse width = 411 µs (18-bit resolution)
-6. Set LED drive currents (Red = 0x24, IR = 0x24, approximately 7.2 mA each)
-7. Clear FIFO write/read pointers and overflow counter
+2. Wait a fixed 100 ms for reset to complete (`vTaskDelay` — not polled)
+3. Set LED1 (IR) drive current (`REG_LED1_PA` = `0x1F`, ≈6.2 mA)
+4. Clear FIFO write pointer, overflow counter, and read pointer
+5. Configure SpO2 config register (`REG_SPO2_CONFIG` = `0x47`)
+6. Set mode config to **HR-only mode** (`REG_MODE_CONFIG` = `0x02`) — only the IR LED channel is active; this is not SpO2 mode, and only one LED register (`LED1_PA`) is ever written
 
 **FIFO management:**
 
-The MAX30102 FIFO holds up to 32 samples. Each sample contains one Red word and one IR word at 18-bit resolution, packed into 3 bytes each (6 bytes per sample). On each callback invocation:
+The MAX30102 FIFO holds up to 32 samples. `max30102_read` (in `main/pulse_sensor.c`) on each call:
 
 ```c
-uint8_t wr_ptr, rd_ptr, overflow;
-// read FIFO_WR_PTR, OVF_COUNTER, FIFO_RD_PTR in one burst
-// num_available = (wr_ptr - rd_ptr) & 0x1F
+uint8_t available = (wr_reg - rd_reg + 32) % 32;
+if (available == 0) return false;
+// reads exactly one 3-byte FIFO word, regardless of how many are available
 ```
 
-Samples are burst-read in a single I2C transaction (up to 6 × 32 = 192 bytes). Each 3-byte word is unpacked to 18 bits:
+The write and read pointers are fetched in two separate I2C transactions (not a single burst), and only **one sample per call** is popped from the FIFO — `available` is computed but not used to drain multiple entries. If the timer callback runs slower than the sensor fills the FIFO, samples can back up toward overflow. A single 3-byte word is unpacked to 18 bits:
 
 ```c
-uint32_t sample = ((buf[0] & 0x03) << 16) | (buf[1] << 8) | buf[2];
+uint32_t sample = ((data[0] & 0x03) << 16) | (data[1] << 8) | data[2];
 ```
 
-Only the IR channel is used for pulse detection; the Red channel is read but currently discarded.
+Because the device is in HR-only mode, there is no Red channel to discard — only IR is sampled at all.
 
 ---
 
 ## Signal Processing Pipeline
 
-The pipeline runs once per sample inside the 100 Hz timer callback. All processing is fixed-point arithmetic using 32-bit integers to avoid floating-point overhead in the ISR context.
+The pipeline runs once per sample inside `sampling_callback` (`main/sensor-logger.c`). All processing uses `float` arithmetic — there is no fixed-point/integer implementation.
 
 ```
 Raw IR sample (18-bit)
         │
         ▼
 ┌───────────────────┐
-│  DC Offset Removal │  EMA: dc = α·dc + (1-α)·sample,  α = 0.95
+│  DC Offset Removal │  EMA: dc = α·dc + (1-α)·sample,  α = 0.99
 │  (EMA filter)      │  signal = sample - dc
 └────────┬──────────┘
          │
@@ -316,59 +314,75 @@ Raw IR sample (18-bit)
          │
          ▼
 ┌───────────────────┐
-│  Adaptive Peak    │  threshold = γ·peak_value,  γ = 0.5
-│  Detection        │  Peak confirmed if signal crosses threshold
-│                   │  and minimum refractory period elapsed (300 ms)
+│  Adaptive Peak    │  threshold = midpoint + γ·(range),  γ = 0.3
+│  Detection        │  threshold = (max+min)/2 + 0.3·(max-min)
+│                   │  Peak confirmed on rising edge crossing the threshold
 └────────┬──────────┘
          │
          ▼
 ┌───────────────────┐
-│  IBI → BPM        │  bpm = 60000 / ibi_ms
+│  IBI → BPM        │  bpm = 60,000,000 / ibi_us
 │  (sanity bounded) │  Valid range: 40–200 BPM
 └───────────────────┘
 ```
 
-**Filter coefficients and their meaning:**
+**Filter coefficients and their meaning (as implemented in `main/sensor-logger.c`):**
 
 | Symbol | Value | Role |
 |---|---|---|
-| α (EMA DC) | 0.95 | DC tracking time constant. Higher = slower DC adaptation, more stable baseline. At 100 Hz, τ ≈ 200 ms. |
-| β (IIR LP) | 0.85 | Low-pass pole location. Cutoff ≈ (1-β)·Fs/(2π) ≈ 2.4 Hz. Passes heart rate fundamentals (0.7–3.3 Hz) while rejecting motion artifacts above 2.4 Hz. |
-| γ (threshold) | 0.50 | Adaptive threshold fraction of the last detected peak amplitude. Resets upward on each confirmed peak. |
+| α (EMA DC) | 0.99 | DC tracking time constant (`dc_mean = (dc_mean*99 + sample)/100`). Higher = slower DC adaptation, more stable baseline. |
+| β (IIR LP) | 0.85 | Low-pass pole location (`filtered = filtered*0.85 + ac_signal*0.15`). Cutoff ≈ (1-β)·Fs/(2π) ≈ 2.4 Hz. Passes heart rate fundamentals (0.7–3.3 Hz) while rejecting motion artifacts above 2.4 Hz. |
+| γ (threshold) | 0.30 | Adaptive threshold set at the midpoint between the running min/max of the filtered signal, offset by 30% of the min-max range. `signal_min`/`signal_max` are running extrema that are never decayed or reset, so the threshold adapts slowly to changing signal amplitude. |
 
-**Refractory period:** A minimum inter-beat interval of 300 ms (= 200 BPM ceiling) is enforced to prevent the peak detector from double-triggering on the same pulse wavefront.
+**No refractory period is implemented.** There is no minimum inter-beat-interval gate on the rising-edge detection itself — the only guard against double-triggering is the BPM sanity bound below, applied after IBI is computed.
 
-**BPM sanity bounds:** IBI values outside 300 ms–1500 ms (40–200 BPM) are discarded. This eliminates spurious detections during sensor placement and motion.
+**BPM sanity bounds:** IBI values (computed from `esp_timer_get_time()`, in microseconds) outside 300,000–1,500,000 µs (40–200 BPM) are discarded and no BPM is printed for that beat. This eliminates spurious detections during sensor placement and motion.
 
 ---
 
 ## Known Issues and Limitations
 
-**No interrupt-driven sampling**
-The MAX30102 has an INT pin that asserts when the FIFO almost-full threshold is reached. This project polls instead, which wastes CPU in the timer callback and risks FIFO overflow at high sample rates. INT-driven sampling would reduce CPU load and eliminate the overflow risk.
+**VL53L0X is built but not wired up at runtime**
+`tof_init()`/`tof_read()` exist and compile, but the call site in `app_main` (`main/sensor-logger.c`) is commented out. Re-enabling it requires adding the bus arbitration described below.
 
-**I2C mutex held across FIFO burst reads**
-The mutex is held for the full duration of a 192-byte burst read (~1.5 ms at 400 kHz). This blocks the ToF sensor for the entire burst window. A double-buffered approach or shorter burst reads would reduce contention.
+**No I2C bus arbitration**
+There is no mutex or other serialization around I2C access. This is currently harmless only because the ToF path is disabled — if it were re-enabled alongside the timer-driven MAX30102 sampling, the two would have no protection against interleaved transactions on the shared bus.
+
+**Software-timer sampling instead of `esp_timer`**
+Sampling uses `xTimerCreate` (a FreeRTOS software timer) with a 10 ms period, and `CONFIG_FREERTOS_HZ=100` makes the FreeRTOS tick itself 10 ms — the timer period equals the tick granularity, a plausible source of sampling jitter. `esp_timer` would give microsecond-resolution, jitter-free scheduling.
+
+**No interrupt-driven sampling**
+The MAX30102 has an INT pin that asserts when the FIFO almost-full threshold is reached. This project polls instead on a timer, which wastes CPU and risks FIFO overflow at higher sample rates — worsened by the fact that only one sample is drained from the FIFO per callback (see below).
+
+**Single-sample FIFO reads**
+`max30102_read()` computes how many samples are available in the FIFO but only pops one per call, regardless of that count. If the callback ever runs slower than the sensor fills the FIFO, unread samples accumulate toward overflow. A burst read of all available samples would fix this.
+
+**No refractory period on peak detection**
+The rising-edge threshold crossing has no minimum time gate before the IBI/BPM sanity check; a noisy signal near the threshold could register spurious edge crossings between real beats (though only crossings that produce an IBI within 300–1500 ms are ever printed).
 
 **Fixed LED drive current**
-The MAX30102 LED current is set at init and never adjusted. In practice, adequate perfusion varies by finger placement and skin pigmentation. An AGC loop that targets a mid-scale ADC value would improve reliability across users.
+The MAX30102 LED current is set once at init (`0x1F` on `LED1_PA`) and never adjusted. In practice, adequate perfusion varies by finger placement and skin pigmentation. An AGC loop that targets a mid-scale ADC value would improve reliability across users.
 
 **Single-sample peak detection**
 The peak detector operates on individual filtered samples without windowed amplitude tracking. Noisy waveforms can produce false positives or missed peaks. A template-matching or Pan-Tompkins-style detector would be more robust.
 
 **No SpO2 computation**
-Both Red and IR channels are sampled, but only IR is used. Red/IR ratio for SpO2 estimation is not implemented.
+The device is configured in HR-only mode (IR channel only) — no Red LED channel is enabled, so no Red/IR ratio can be computed. Full SpO2 support would require reconfiguring `REG_MODE_CONFIG` to SpO2 mode and adding a second LED drive register.
 
-**VL53L0X blocks app_main**
-`tof_read_mm()` uses a blocking ranging call. If the sensor does not respond (disconnected, power issue), `app_main` stalls. The vendor driver should be wrapped with a timeout.
+**Leftover bring-up code in `app_main`**
+`app_main` runs a full I2C address scan (1–126) on every boot before initializing the MAX30102. This was useful during hardware bring-up but has no functional purpose in normal operation.
 
 ---
 
 ## Future Improvements
 
+- **Re-enable the VL53L0X path** — uncomment the ToF call site in `app_main` and add an `i2c_mutex` (`SemaphoreHandle_t`) around each driver's transaction sequence before running both sensors concurrently
+- **Switch to `esp_timer`** for the sampling callback to get microsecond-resolution, jitter-free scheduling independent of the FreeRTOS tick rate
+- **Burst FIFO reads** — drain all `available` samples per callback instead of one, using the write/read pointer delta already computed in `max30102_read()`
+- **Migrate to the `i2c_master` bus-handle API** — replace the legacy `driver/i2c.h` calls with ESP-IDF's newer handle-based I2C driver
 - **INT-driven MAX30102 sampling** — wire the INT pin to a GPIO, register an ISR, and use a FreeRTOS queue to hand samples to a processing task
 - **AGC for LED current** — target 50–70% ADC full-scale; adjust LED drive register each second
-- **SpO2 estimation** — compute R = (AC_red/DC_red) / (AC_ir/DC_ir) and map to SpO2 via calibration curve
+- **SpO2 estimation** — reconfigure to SpO2 mode with both LEDs active, then compute R = (AC_red/DC_red) / (AC_ir/DC_ir) and map to SpO2 via calibration curve
 - **BLE notifications** — stream BPM and distance over BLE using the ESP-IDF NimBLE stack
 - **MQTT / Wi-Fi logging** — publish samples to an MQTT broker for real-time dashboarding
 - **Multiple VL53L0X sensors** — use XSHUT GPIO toggling to reassign I2C addresses at boot, enabling multi-zone distance sensing
